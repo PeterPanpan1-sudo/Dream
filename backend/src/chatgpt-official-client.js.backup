@@ -1,0 +1,789 @@
+/**
+ * ChatGPT 官方网页生图链路 (链路A) —— 完整复刻 image 项目的 f/conversation 流程。
+ *
+ * 参考: internal/backend/backend.go + internal/backend/responses_image.go + internal/backend/pow.go
+ *
+ * 完整步骤:
+ *   1. bootstrap   GET /                                  -> 解析 PoW 脚本源 + cf cookie
+ *   2. sentinel    POST /backend-api/sentinel/chat-requirements (含 PoW) -> token / proof_token
+ *   3. prepare     POST /backend-api/f/conversation/prepare -> conduit_token
+ *   4. stream      POST /backend-api/f/conversation (SSE)   -> sediment:// / file-service:// 指针
+ *   5. download    GET  /backend-api/files/download/{id}?conversation_id=... -> download_url -> 图片二进制
+ *
+ * 注意:
+ *   - 与 codex 链路不同, 官方链路图片以"资产指针"返回, 需要二次下载。
+ *   - 需要维护 cookie (cf_clearance / __cf_bm 等), 否则后续请求会被 Cloudflare 拦截。
+ *   - 上游受 Cloudflare TLS 指纹保护; 若直连被 403, 需配合干净代理 (CHATGPT_PROXY)。
+ */
+
+import { createSession } from 'wreq-js';
+import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
+import { Readable } from 'stream';
+import { getProxyUrl } from './proxy.js';
+import { resolveChatgptAccountId } from './chatgpt-client.js';
+import { uploadToR2 } from './r2.js';
+
+const CHATGPT_API_BASE = process.env.CHATGPT_API_BASE || 'https://chatgpt.com';
+
+const PREPARE_PATH = '/backend-api/f/conversation/prepare';
+const STREAM_PATH = '/backend-api/f/conversation';
+const DEFAULT_POW_SCRIPT = 'https://chatgpt.com/backend-api/sentinel/sdk.js';
+
+const CLIENT_VERSION = 'prod-be885abbfcfe7b1f511e88b3003d9ee44757fbad';
+const CLIENT_BUILD_NUMBER = '5955942';
+
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
+const SEC_CH_UA = '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"';
+const SEC_CH_UA_FULL_VERSION_LIST =
+  '"Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0", "Chromium";v="145.0.0.0"';
+
+const REQUEST_TIMEOUT_MS = 300000;
+const DOWNLOAD_ATTEMPTS = 3;
+const DOWNLOAD_RETRY_DELAY_MS = 750;
+
+// ============================ PoW (SHA3-512) ============================
+
+function parsePowResources(html) {
+  const sources = [];
+  let dataBuild = '';
+  const scriptRe = /<script[^>]+src=["']([^"']+)["']/gi;
+  let match;
+  while ((match = scriptRe.exec(html)) !== null) {
+    const src = match[1];
+    sources.push(src);
+    if (!dataBuild) {
+      const hit = /c\/[^/]*\/_/.exec(src);
+      if (hit) dataBuild = hit[0];
+    }
+  }
+  if (!dataBuild) {
+    const m = /<html[^>]*data-build=["']([^"']*)["']/.exec(html);
+    if (m) dataBuild = m[1];
+  }
+  if (sources.length === 0) sources.push(DEFAULT_POW_SCRIPT);
+  return { sources, dataBuild };
+}
+
+const NAVIGATOR_KEYS = [
+  'registerProtocolHandler\u2212function registerProtocolHandler() { [native code] }',
+  'storage\u2212[object StorageManager]', 'locks\u2212[object LockManager]', 'appCodeName\u2212Mozilla',
+  'permissions\u2212[object Permissions]', 'share\u2212function share() { [native code] }', 'webdriver\u2212false',
+  'managed\u2212[object NavigatorManagedData]', 'canShare\u2212function canShare() { [native code] }',
+  'vendor\u2212Google Inc.', 'mediaDevices\u2212[object MediaDevices]', 'vibrate\u2212function vibrate() { [native code] }',
+  'storageBuckets\u2212[object StorageBucketManager]', 'mediaCapabilities\u2212[object MediaCapabilities]',
+  'cookieEnabled\u2212true', 'virtualKeyboard\u2212[object VirtualKeyboard]', 'product\u2212Gecko',
+  'presentation\u2212[object Presentation]', 'onLine\u2212true', 'mimeTypes\u2212[object MimeTypeArray]',
+  'credentials\u2212[object CredentialsContainer]', 'serviceWorker\u2212[object ServiceWorkerContainer]',
+  'keyboard\u2212[object Keyboard]', 'gpu\u2212[object GPU]', 'doNotTrack', 'serial\u2212[object Serial]',
+  'pdfViewerEnabled\u2212true', 'language\u2212zh-CN', 'geolocation\u2212[object Geolocation]',
+  'userAgentData\u2212[object NavigatorUAData]', 'getUserMedia\u2212function getUserMedia() { [native code] }',
+  'sendBeacon\u2212function sendBeacon() { [native code] }', 'hardwareConcurrency\u221232',
+  'windowControlsOverlay\u2212[object WindowControlsOverlay]'
+];
+
+const WINDOW_KEYS = [
+  '0', 'window', 'self', 'document', 'name', 'location', 'customElements', 'history', 'navigation',
+  'innerWidth', 'innerHeight', 'scrollX', 'scrollY', 'visualViewport', 'screenX', 'screenY', 'outerWidth',
+  'outerHeight', 'devicePixelRatio', 'screen', 'chrome', 'navigator', 'onresize', 'performance', 'crypto',
+  'indexedDB', 'sessionStorage', 'localStorage', 'scheduler', 'alert', 'atob', 'btoa', 'fetch', 'matchMedia',
+  'postMessage', 'queueMicrotask', 'requestAnimationFrame', 'setInterval', 'setTimeout', 'caches',
+  '__NEXT_DATA__', '__BUILD_MANIFEST', '__NEXT_PRELOADREADY'
+];
+
+const DOCUMENT_KEYS = ['_reactListeningo743lnnpvdg', 'location'];
+const CORES = [8, 16, 24, 32];
+
+function randomChoice(items) {
+  if (!items || items.length === 0) return '';
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function buildPowConfig(userAgent, scriptSources, dataBuild) {
+  if (!scriptSources || scriptSources.length === 0) scriptSources = [DEFAULT_POW_SCRIPT];
+  const nowMs = Date.now();
+  const estDate =
+    new Date().toString().replace(/GMT.*$/, '') + 'GMT-0500 (Eastern Standard Time)';
+  return [
+    randomChoice([3000, 4000, 5000]),
+    estDate,
+    4294705152,
+    0, // placeholder for i
+    userAgent,
+    randomChoice(scriptSources),
+    dataBuild,
+    'en-US',
+    'en-US,es-US,en,es',
+    0, // placeholder for i>>1
+    randomChoice(NAVIGATOR_KEYS),
+    randomChoice(DOCUMENT_KEYS),
+    randomChoice(WINDOW_KEYS),
+    nowMs,
+    uuidv4(),
+    '',
+    randomChoice(CORES),
+    0
+  ];
+}
+
+function powGenerate(seed, difficulty, config, limit) {
+  const target = Buffer.from(difficulty, 'hex');
+  const diffLen = target.length > 0 ? target.length : 3;
+  const seedBytes = Buffer.from(seed, 'utf8');
+
+  let part1 = JSON.stringify(config.slice(0, 3));
+  part1 = part1.slice(0, -1) + ',';
+  let part2 = JSON.stringify(config.slice(4, 9));
+  part2 = ',' + part2.slice(1, -1) + ',';
+  let part3 = JSON.stringify(config.slice(10));
+  part3 = ',' + part3.slice(1);
+
+  for (let i = 0; i < limit; i++) {
+    const finalJSON = part1 + i + part2 + (i >> 1) + part3;
+    const encoded = Buffer.from(finalJSON, 'utf8').toString('base64');
+    const hash = crypto
+      .createHash('sha3-512')
+      .update(Buffer.concat([seedBytes, Buffer.from(encoded, 'utf8')]))
+      .digest();
+    if (Buffer.compare(hash.subarray(0, diffLen), target) <= 0) {
+      return { answer: encoded, solved: true };
+    }
+  }
+  const fallback =
+    'wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D' + Buffer.from('"' + seed + '"', 'utf8').toString('base64');
+  return { answer: fallback, solved: false };
+}
+
+function buildLegacyRequirementsToken(userAgent, scriptSources, dataBuild) {
+  const seed = Math.random().toFixed(6);
+  const config = buildPowConfig(userAgent, scriptSources, dataBuild);
+  const { answer } = powGenerate(seed, '0fffff', config, 500000);
+  return 'gAAAAAC' + answer;
+}
+
+function buildProofToken(seed, difficulty, userAgent, scriptSources, dataBuild) {
+  const config = buildPowConfig(userAgent, scriptSources, dataBuild);
+  const { answer } = powGenerate(seed, difficulty || '0fffff', config, 500000);
+  return 'gAAAAAB' + answer;
+}
+
+// ============================ Cookie Jar ============================
+// wreq-js session automatically manages cookies (cf_clearance, __cf_bm, etc.)
+
+// ============================ 模型 / 尺寸 ============================
+
+function officialImageModelSlug(model) {
+  switch (String(model || '').trim()) {
+    case 'gpt-image-2':
+      return 'gpt-5-5';
+    case 'codex-gpt-image-2':
+      return 'codex-gpt-image-2';
+    case '':
+    case 'auto':
+      return 'auto';
+    default:
+      return 'auto';
+  }
+}
+
+function buildOfficialImageSizeHint(size) {
+  let s = String(size || '').toLowerCase().trim();
+  if (s === '' || s === 'auto') return '';
+  s = s.replace(/×/g, 'x').replace(/\s+/g, '');
+  const hints = {
+    '1:1': '输出为 1:1 正方形构图，主体居中，适合正方形画幅。',
+    '3:2': '输出为 3:2 横版构图，适合摄影、产品展示和横向叙事画幅。',
+    '2:3': '输出为 2:3 竖版构图，适合海报、人物和纵向叙事画幅。',
+    '16:9': '输出为 16:9 横屏构图，适合宽画幅展示。',
+    '9:16': '输出为 9:16 竖屏构图，适合竖版画幅展示。',
+    '4:3': '输出为 4:3 比例，兼顾宽度与高度，适合展示画面细节。',
+    '3:4': '输出为 3:4 比例，纵向构图，适合人物肖像或竖向场景。',
+    '1080p': '以 1080 x 1080 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。',
+    '2k': '以 2048 x 2048 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。',
+    '4k': '以 2880 x 2880 像素对应的正方形画幅作为构图偏好，实际像素以上游返回为准。'
+  };
+  if (hints[s]) return hints[s];
+  const dim = s.match(/^(\d+)x(\d+)$/);
+  if (dim) {
+    return `以 ${dim[1]} x ${dim[2]} 像素对应的宽高比作为构图偏好，实际像素以上游返回为准。`;
+  }
+  return '输出图片，目标尺寸或宽高比为 ' + s + '。';
+}
+
+function buildOfficialImagePrompt(prompt, size, quality, resolution) {
+  const p = String(prompt || '').trim();
+  if (!p) return '';
+  const parts = [p];
+  const sizeHint = buildOfficialImageSizeHint(size);
+  if (sizeHint) parts.push(sizeHint);
+  if (quality && quality !== 'standard') {
+    parts.push(quality === 'hd' ? '请输出高清质量图片，注重细节和清晰度。' : `请输出 ${quality} 质量图片。`);
+  }
+  if (resolution) {
+    const resMap = { '1k': '1024x1024', '2k': '2048x2048', '4k': '4096x4096', '1080p': '1920x1080' };
+    const target = resMap[resolution] || resolution;
+    parts.push(`目标清晰度为 ${target} 级别，尽可能保持高分辨率。`);
+  }
+  return parts.join('\n\n');
+}
+
+function filterImageIDs(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const v = String(value || '').trim();
+    if (!v || v === 'file_upload' || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================ 官方生图客户端 ============================
+
+class OfficialImageClient {
+  constructor(account) {
+    this.accessToken = String(account?.access_token || '').trim();
+    this.accountId = resolveChatgptAccountId(account);
+    this.deviceId = uuidv4();
+    this.sessionId = uuidv4();
+    this.proxyUrl = getProxyUrl();
+    this.powSources = [DEFAULT_POW_SCRIPT];
+    this.powDataBuild = '';
+    this.session = null;
+  }
+
+  async ensureSession() {
+    if (this.session) return;
+    this.session = await createSession({
+      browser: 'chrome_142',
+      os: 'windows',
+      proxy: this.proxyUrl || undefined,
+      timeout: REQUEST_TIMEOUT_MS,
+    });
+  }
+
+  async closeSession() {
+    if (this.session) {
+      await this.session.close();
+      this.session = null;
+    }
+  }
+
+  commonHeaders(targetPath, extra = {}) {
+    const headers = {
+      'User-Agent': BROWSER_USER_AGENT,
+      Origin: CHATGPT_API_BASE,
+      Referer: CHATGPT_API_BASE + '/',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      Priority: 'u=1, i',
+      'Sec-Ch-Ua': SEC_CH_UA,
+      'Sec-Ch-Ua-Arch': '"x86"',
+      'Sec-Ch-Ua-Bitness': '"64"',
+      'Sec-Ch-Ua-Full-Version': '"145.0.0.0"',
+      'Sec-Ch-Ua-Full-Version-List': SEC_CH_UA_FULL_VERSION_LIST,
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Model': '""',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Ch-Ua-Platform-Version': '"19.0.0"',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'OAI-Device-Id': this.deviceId,
+      'OAI-Session-Id': this.sessionId,
+      'OAI-Language': 'zh-CN',
+      'OAI-Client-Version': CLIENT_VERSION,
+      'OAI-Client-Build-Number': CLIENT_BUILD_NUMBER,
+      'X-OpenAI-Target-Path': targetPath,
+      'X-OpenAI-Target-Route': targetPath
+    };
+    if (this.accessToken) headers.Authorization = 'Bearer ' + this.accessToken;
+    if (this.accountId) headers['Chatgpt-Account-Id'] = this.accountId;
+    return { ...headers, ...extra };
+  }
+
+  officialHeaders(targetPath, reqs, conduitToken, accept) {
+    const extra = {
+      'Content-Type': 'application/json',
+      Accept: accept,
+      'OpenAI-Sentinel-Chat-Requirements-Token': reqs.token
+    };
+    if (reqs.proofToken) extra['OpenAI-Sentinel-Proof-Token'] = reqs.proofToken;
+    if (reqs.turnstileToken) extra['OpenAI-Sentinel-Turnstile-Token'] = reqs.turnstileToken;
+    if (reqs.soToken) extra['OpenAI-Sentinel-SO-Token'] = reqs.soToken;
+    if (conduitToken) extra['X-Conduit-Token'] = conduitToken;
+    if (accept === 'text/event-stream') extra['X-Oai-Turn-Trace-Id'] = uuidv4();
+    return this.commonHeaders(targetPath, extra);
+  }
+
+  async fetchUpstream(url, options = {}) {
+    await this.ensureSession();
+    return await this.session.fetch(url, { timeout: REQUEST_TIMEOUT_MS, ...options });
+  }
+
+  async bootstrap() {
+    const response = await this.fetchUpstream(CHATGPT_API_BASE + '/', {
+      method: 'GET',
+      headers: {
+        'User-Agent': BROWSER_USER_AGENT,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Sec-Ch-Ua': SEC_CH_UA,
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+      }
+    });
+    const html = await response.text();
+    if (!response.ok) {
+      throw httpError('bootstrap', response.status, html);
+    }
+    const parsed = parsePowResources(html);
+    this.powSources = parsed.sources;
+    this.powDataBuild = parsed.dataBuild;
+  }
+
+  async getChatRequirements() {
+    const targetPath = '/backend-api/sentinel/chat-requirements';
+    const p = buildLegacyRequirementsToken(BROWSER_USER_AGENT, this.powSources, this.powDataBuild);
+    const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
+      method: 'POST',
+      headers: this.commonHeaders(targetPath, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ p })
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw httpError('chat_requirements', response.status, text);
+    }
+    const data = JSON.parse(text);
+    if (data.arkose && data.arkose.required) {
+      throw new Error('上游要求 Arkose 验证码，链路A 暂不支持');
+    }
+    let proofToken = '';
+    if (data.proofofwork && data.proofofwork.required) {
+      proofToken = buildProofToken(
+        data.proofofwork.seed,
+        data.proofofwork.difficulty,
+        BROWSER_USER_AGENT,
+        this.powSources,
+        this.powDataBuild
+      );
+    }
+    if (!data.token) {
+      throw new Error('sentinel 未返回 chat-requirements token: ' + JSON.stringify(data).slice(0, 200));
+    }
+    return {
+      token: data.token,
+      proofToken,
+      turnstileToken: '',
+      soToken: data.so_token || ''
+    };
+  }
+
+  async prepareConversation(prompt, reqs, model) {
+    const targetPath = PREPARE_PATH;
+    const payload = {
+      action: 'next',
+      fork_from_shared_post: false,
+      parent_message_id: uuidv4(),
+      model: officialImageModelSlug(model),
+      client_prepare_state: 'success',
+      timezone_offset_min: -480,
+      timezone: 'Asia/Shanghai',
+      conversation_mode: { kind: 'primary_assistant' },
+      system_hints: ['picture_v2'],
+      partial_query: {
+        id: uuidv4(),
+        author: { role: 'user' },
+        content: { content_type: 'text', parts: [prompt] }
+      },
+      supports_buffering: true,
+      supported_encodings: ['v1'],
+      client_contextual_info: { app_name: 'chatgpt.com' }
+    };
+    const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
+      method: 'POST',
+      headers: this.officialHeaders(targetPath, reqs, '', '*/*'),
+      body: JSON.stringify(payload)
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw httpError('prepare', response.status, text);
+    }
+    let data = {};
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = {};
+    }
+    return data.conduit_token || '';
+  }
+
+  async startConversation(prompt, reqs, conduitToken, model) {
+    const targetPath = STREAM_PATH;
+    const payload = {
+      action: 'next',
+      messages: [
+        {
+          id: uuidv4(),
+          author: { role: 'user' },
+          create_time: Date.now() / 1000,
+          content: { content_type: 'text', parts: [prompt] },
+          metadata: {
+            developer_mode_connector_ids: [],
+            selected_github_repos: [],
+            selected_all_github_repos: false,
+            system_hints: ['picture_v2'],
+            serialization_metadata: { custom_symbol_offsets: [] }
+          }
+        }
+      ],
+      parent_message_id: uuidv4(),
+      model: officialImageModelSlug(model),
+      client_prepare_state: 'sent',
+      timezone_offset_min: -480,
+      timezone: 'Asia/Shanghai',
+      conversation_mode: { kind: 'primary_assistant' },
+      enable_message_followups: true,
+      system_hints: ['picture_v2'],
+      supports_buffering: true,
+      supported_encodings: ['v1'],
+      paragen_cot_summary_display_override: 'allow',
+      force_parallel_switch: 'auto',
+      client_contextual_info: {
+        is_dark_mode: false,
+        time_since_loaded: 1200,
+        page_height: 1072,
+        page_width: 1724,
+        pixel_ratio: 1.2,
+        screen_height: 1440,
+        screen_width: 2560,
+        app_name: 'chatgpt.com'
+      }
+    };
+    const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
+      method: 'POST',
+      headers: this.officialHeaders(targetPath, reqs, conduitToken, 'text/event-stream'),
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw httpError('f/conversation', response.status, text);
+    }
+    return response;
+  }
+
+  parseStream(response) {
+    const state = {
+      conversationId: '',
+      fileIDs: [],
+      sedimentIDs: [],
+      text: '',
+      blocked: false
+    };
+    let buffer = '';
+    let streamError = null;
+
+    const ingest = (payload) => {
+      const data = payload.trim();
+      if (!data || data === '[DONE]') return;
+
+      const cidMatch = data.match(/"conversation_id"\s*:\s*"([^"]+)"/);
+      if (cidMatch && !state.conversationId) state.conversationId = cidMatch[1];
+
+      for (const m of data.matchAll(/sediment:\/\/([A-Za-z0-9_-]+)/g)) {
+        if (!state.sedimentIDs.includes(m[1])) state.sedimentIDs.push(m[1]);
+      }
+      for (const m of data.matchAll(/file-service:\/\/([A-Za-z0-9_-]+)/g)) {
+        if (!state.fileIDs.includes(m[1])) state.fileIDs.push(m[1]);
+      }
+
+      let event;
+      try {
+        event = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (event.conversation_id) state.conversationId = event.conversation_id;
+      const v = event.v && typeof event.v === 'object' ? event.v : {};
+      if (v.conversation_id) state.conversationId = v.conversation_id;
+
+      if (event.type === 'moderation') {
+        const moderation = event.moderation_response || {};
+        if (moderation.blocked) state.blocked = true;
+      }
+      if (event.type === 'error') {
+        const message =
+          event.message || (event.error && event.error.message) || 'official image route returned an error';
+        streamError = new Error(message);
+        return;
+      }
+      const text = officialAssistantText(event);
+      if (text) state.text = text;
+    };
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('SSE 流超时')), REQUEST_TIMEOUT_MS);
+      const nodeStream = Readable.fromWeb(response.body);
+      nodeStream.on('data', (chunk) => {
+        buffer += chunk.toString('utf8');
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) ingest(trimmed.slice(5));
+        }
+      });
+      nodeStream.on('end', () => {
+        clearTimeout(timer);
+        const trimmed = buffer.trim();
+        if (trimmed.startsWith('data:')) ingest(trimmed.slice(5));
+        if (streamError) reject(streamError);
+        else resolve(state);
+      });
+      nodeStream.on('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+  }
+
+  async getDownloadUrl(conversationId, fileId) {
+    const targetPath = '/backend-api/files/download/' + encodeURIComponent(fileId);
+    const query = new URLSearchParams({ conversation_id: conversationId, inline: 'false' }).toString();
+    const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath + '?' + query, {
+      method: 'GET',
+      headers: this.commonHeaders(targetPath, { Accept: 'application/json' })
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw httpError('files/download', response.status, text);
+    }
+    const data = JSON.parse(text);
+    return data.download_url || data.url || '';
+  }
+
+  async fetchImageBytes(url) {
+    const target = url.startsWith('http') ? url : CHATGPT_API_BASE + url;
+    const isBackend = target.startsWith(CHATGPT_API_BASE + '/backend-');
+    const headers = isBackend
+      ? this.commonHeaders(new URL(target).pathname, {
+          Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+        })
+      : { 'User-Agent': BROWSER_USER_AGENT };
+    const response = await this.fetchUpstream(target, { method: 'GET', headers });
+    if (!response.ok) {
+      const text = await response.text();
+      throw httpError('image_download', response.status, text);
+    }
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  }
+
+  async downloadImageFile(conversationId, fileId) {
+    let lastErr = null;
+    for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+      try {
+        const url = await this.getDownloadUrl(conversationId, fileId);
+        if (!url) throw new Error('下载地址为空: ' + fileId);
+        return await this.fetchImageBytes(url);
+      } catch (error) {
+        lastErr = error;
+        if (attempt < DOWNLOAD_ATTEMPTS) await sleep(DOWNLOAD_RETRY_DELAY_MS);
+      }
+    }
+    throw lastErr;
+  }
+
+  async pollConversation(conversationId) {
+    const targetPath = '/backend-api/conversation/' + conversationId;
+    let delay = 1000;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
+        method: 'GET',
+        headers: this.commonHeaders(targetPath, { Accept: 'application/json' })
+      });
+      if (response.status === 429) {
+        await sleep(Math.min(delay, 8000));
+        delay = Math.min(delay * 2, 8000);
+        continue;
+      }
+      const text = await response.text();
+      if (!response.ok) throw httpError('conversation', response.status, text);
+      const result = extractPointersFromConversation(JSON.parse(text));
+      if (result.fileIDs.length > 0 || result.sedimentIDs.length > 0 || result.text) {
+        return result;
+      }
+      await sleep(Math.min(delay, 8000));
+      delay = Math.min(delay * 2, 8000);
+    }
+    return { fileIDs: [], sedimentIDs: [], text: '' };
+  }
+
+  async generate(prompt, options = {}) {
+    const trimmed = String(prompt || '').trim();
+    if (!trimmed) throw new Error('prompt is required');
+    if (!this.accessToken) throw new Error('账号缺少 access_token');
+
+    const streamPrompt = buildOfficialImagePrompt(trimmed, options.size, options.quality, options.resolution);
+
+    await this.bootstrap();
+    const reqs = await this.getChatRequirements();
+    const conduitToken = await this.prepareConversation(streamPrompt, reqs, options.model);
+    const response = await this.startConversation(streamPrompt, reqs, conduitToken, options.model);
+    const state = await this.parseStream(response);
+    this.lastConversationId = state.conversationId;
+
+    let fileIDs = filterImageIDs(state.fileIDs);
+    let sedimentIDs = filterImageIDs(state.sedimentIDs);
+    let text = state.text;
+
+    if (fileIDs.length === 0 && sedimentIDs.length === 0 && state.conversationId) {
+      const polled = await this.pollConversation(state.conversationId);
+      fileIDs = filterImageIDs([...fileIDs, ...polled.fileIDs]);
+      sedimentIDs = filterImageIDs([...sedimentIDs, ...polled.sedimentIDs]);
+      if (!text) text = polled.text;
+    }
+
+    // sediment:// 为生图结果指针, 优先; 否则回退 file-service://
+    const imageIDs = sedimentIDs.length > 0 ? sedimentIDs : fileIDs;
+    if (imageIDs.length === 0) {
+      if (state.blocked) {
+        const err = new Error('内容被上游审核拦截');
+        err.code = 'image_generation_blocked';
+        throw err;
+      }
+      const err = new Error(
+        text ? '上游返回了文本而非图片: ' + text : '未从官方链路获取到图片指针（可能是文本回复或权限不足）'
+      );
+      err.code = 'image_generation_text_response';
+      throw err;
+    }
+
+    return imageIDs;
+  }
+}
+
+function officialAssistantText(event) {
+  for (const candidate of [event, event && event.v]) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const message = candidate.message && typeof candidate.message === 'object' ? candidate.message : null;
+    if (!message) continue;
+    const author = message.author || {};
+    if (String(author.role || '').toLowerCase() !== 'assistant') continue;
+    const content = message.content || {};
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    const out = [];
+    for (const part of parts) {
+      if (typeof part === 'string' && part.trim()) out.push(part.trim());
+      else if (part && typeof part === 'object' && typeof part.text === 'string' && part.text.trim()) {
+        out.push(part.text.trim());
+      }
+    }
+    const joined = out.join('\n').trim();
+    if (joined) return joined;
+  }
+  return '';
+}
+
+function extractPointersFromConversation(data) {
+  const mapping = data && typeof data.mapping === 'object' ? data.mapping : {};
+  const fileIDs = [];
+  const sedimentIDs = [];
+  let assistantText = '';
+  for (const node of Object.values(mapping)) {
+    const message = node && node.message ? node.message : null;
+    if (!message) continue;
+    const author = message.author || {};
+    const role = String(author.role || '').toLowerCase();
+    const content = message.content || {};
+    if (role === 'assistant') {
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      const text = parts.filter((p) => typeof p === 'string').join('\n').trim();
+      if (text) assistantText = text;
+    }
+    if (role !== 'tool') continue;
+    if (content.content_type !== 'multimodal_text') continue;
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    for (const part of parts) {
+      const text = typeof part === 'string' ? part : part && part.asset_pointer ? part.asset_pointer : '';
+      for (const m of String(text).matchAll(/file-service:\/\/([A-Za-z0-9_-]+)/g)) {
+        if (!fileIDs.includes(m[1])) fileIDs.push(m[1]);
+      }
+      for (const m of String(text).matchAll(/sediment:\/\/([A-Za-z0-9_-]+)/g)) {
+        if (!sedimentIDs.includes(m[1])) sedimentIDs.push(m[1]);
+      }
+    }
+  }
+  return { fileIDs, sedimentIDs, text: assistantText };
+}
+
+function httpError(context, status, body) {
+  const snippet = String(body || '').slice(0, 300);
+  const error = new Error(`官方链路 ${context} 失败: ${status} ${snippet}`);
+  error.status = status;
+  return error;
+}
+
+async function saveImage(buffer, _uploadDir, index) {
+  if (!buffer || buffer.length === 0) throw new Error('下载到的图片数据为空');
+  const filename = `${Date.now()}_${index}_${Math.random().toString(36).slice(2, 8)}.png`;
+  const url = await uploadToR2(buffer, filename, 'image/png');
+  console.log(`✅ 图片已上传 R2: ${url} (${buffer.length} bytes)`);
+  return url;
+}
+
+/**
+ * 主函数：通过官方 f/conversation 链路生成图片。
+ * @returns {Promise<Array<{url:string, revisedPrompt:string, outputFormat:string}>>}
+ */
+export async function generateImage(prompt, account, options = {}, uploadDir = 'uploads') {
+  // Inject reference image hints into prompt for official route
+  let finalPrompt = String(prompt || '').trim();
+  if (Array.isArray(options.reference_images) && options.reference_images.length > 0) {
+    const refNames = options.reference_images.map((ref, i) => `参考图${i + 1}`).join('、');
+    finalPrompt = `【${refNames}已上传，请以上传的图片作为参考/风格依据进行创作】\n\n${finalPrompt}`;
+  }
+
+  console.log('\n========================================');
+  console.log('🎨 开始生成图片 (官方 f/conversation 链路)');
+  console.log(`📝 提示词: ${String(finalPrompt).slice(0, 80)}`);
+  console.log(`🔑 账号: ${account?.email}`);
+  console.log(`⚙️  参数: model=${options.model}, size=${options.size}`);
+  console.log('========================================\n');
+
+  const client = new OfficialImageClient(account);
+  try {
+    const imageIDs = await client.generate(finalPrompt, options);
+
+    const results = [];
+    for (let i = 0; i < imageIDs.length; i++) {
+      const buffer = await client.downloadImageFile(client.lastConversationId || '', imageIDs[i]);
+      results.push({
+        url: await saveImage(buffer, uploadDir, i),
+        revisedPrompt: String(prompt).trim(),
+        outputFormat: 'png'
+      });
+    }
+
+    console.log(`\n✅ 官方链路生成成功，共 ${results.length} 张\n`);
+    return results;
+  } finally {
+    await client.closeSession();
+  }
+}
+
+export default { generateImage };
+
+export { buildLegacyRequirementsToken, buildProofToken, powGenerate, parsePowResources };

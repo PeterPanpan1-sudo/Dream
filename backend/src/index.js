@@ -15,6 +15,7 @@ import * as codexClient from './chatgpt-client.js';
 import * as officialClient from './chatgpt-official-client.js';
 import * as textClient from './chatgpt-text-client.js';
 import { uploadToR2, deleteFromR2, listR2Objects } from './r2.js';
+import { AutoRegisterService } from './auto-register/index.js';
 
 dotenv.config();
 
@@ -366,7 +367,7 @@ const getAll = (query, params = []) => {
 // Auth middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+  const token = (authHeader && authHeader.split(' ')[1]) || req.query?.token;
 
   if (!token) {
     return res.status(401).json({ error: 'Access token required' });
@@ -2310,6 +2311,72 @@ app.get('/api/stats', authenticateToken, (req, res) => {
 
 // Serve uploaded images
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+
+// ==================== Auto Register Routes ====================
+
+const autoRegister = new AutoRegisterService({
+  configPath: path.join(__dirname, '../data/auto-register.json'),
+  getPoolMetrics: () => {
+    const totalResult = getOne('SELECT COUNT(*) as count FROM chatgpt_accounts');
+    const activeResult = getOne("SELECT COUNT(*) as count FROM chatgpt_accounts WHERE status = 'active'");
+    return {
+      current_quota: (totalResult?.count || 0) * 10,
+      current_available: activeResult?.count || 0,
+    };
+  },
+  saveAccount: ({ email, access_token, status }) => {
+    const existing = getOne('SELECT id FROM chatgpt_accounts WHERE email = ?', [email]);
+    if (existing) {
+      db.run("UPDATE chatgpt_accounts SET session_token = ?, access_token = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        [access_token, access_token, status, existing.id]);
+    } else {
+      db.run('INSERT INTO chatgpt_accounts (email, session_token, access_token, status, usage_count) VALUES (?, ?, ?, ?, ?)',
+        [email, access_token, access_token, status, 0]);
+    }
+    saveDB();
+  },
+});
+
+app.get('/api/auto-register', authenticateToken, requireAdmin, (req, res) => {
+  res.json(autoRegister.get());
+});
+
+app.post('/api/auto-register', authenticateToken, requireAdmin, (req, res) => {
+  res.json(autoRegister.update(req.body));
+});
+
+app.post('/api/auto-register/start', authenticateToken, requireAdmin, (req, res) => {
+  autoRegister.start();
+  res.json(autoRegister.get());
+});
+
+app.post('/api/auto-register/stop', authenticateToken, requireAdmin, (req, res) => {
+  autoRegister.stop();
+  res.json(autoRegister.get());
+});
+
+app.post('/api/auto-register/reset', authenticateToken, requireAdmin, (req, res) => {
+  autoRegister.reset();
+  res.json(autoRegister.get());
+});
+
+app.get('/api/auto-register/events', authenticateToken, requireAdmin, async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const sub = autoRegister.subscribe();
+  let active = true;
+  const send = (payload) => {
+    if (!active || res.writableEnded) return;
+    res.write(`data: ${payload}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  };
+  sub.onData(send);
+  req.on('close', () => { active = false; sub.close(); });
+});
 
 // Health check
 app.get('/health', (req, res) => {

@@ -18,6 +18,7 @@
 
 import { createSession } from 'wreq-js';
 import { v4 as uuidv4 } from 'uuid';
+import { uploadImageToChat, buildMultimodalContent, buildAttachments } from './chatgpt-image-upload.js';
 import crypto from 'crypto';
 import { Readable } from 'stream';
 import { getProxyUrl } from './proxy.js';
@@ -248,7 +249,8 @@ function sleep(ms) {
 
 class OfficialImageClient {
   constructor(account) {
-    this.accessToken = String(account?.access_token || '').trim();
+    // 支持 session_token 或 access_token（兼容两种字段名）
+    this.accessToken = String(account?.session_token || account?.access_token || '').trim();
     this.accountId = resolveChatgptAccountId(account);
     this.deviceId = uuidv4();
     this.sessionId = uuidv4();
@@ -391,8 +393,12 @@ class OfficialImageClient {
     };
   }
 
-  async prepareConversation(prompt, reqs, model) {
+  async prepareConversation(prompt, reqs, model, uploadedImages = []) {
     const targetPath = PREPARE_PATH;
+
+    // 使用辅助函数构建消息内容
+    const content = buildMultimodalContent(prompt, uploadedImages);
+
     const payload = {
       action: 'next',
       fork_from_shared_post: false,
@@ -406,12 +412,18 @@ class OfficialImageClient {
       partial_query: {
         id: uuidv4(),
         author: { role: 'user' },
-        content: { content_type: 'text', parts: [prompt] }
+        content
       },
       supports_buffering: true,
       supported_encodings: ['v1'],
       client_contextual_info: { app_name: 'chatgpt.com' }
     };
+
+    // 如果有图片，添加 attachments
+    if (uploadedImages.length > 0) {
+      payload.partial_query.attachments = buildAttachments(uploadedImages);
+    }
+
     const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
       method: 'POST',
       headers: this.officialHeaders(targetPath, reqs, '', '*/*'),
@@ -430,25 +442,34 @@ class OfficialImageClient {
     return data.conduit_token || '';
   }
 
-  async startConversation(prompt, reqs, conduitToken, model) {
+  async startConversation(prompt, reqs, conduitToken, model, uploadedImages = []) {
     const targetPath = STREAM_PATH;
+
+    // 使用辅助函数构建消息内容
+    const content = buildMultimodalContent(prompt, uploadedImages);
+
+    const message = {
+      id: uuidv4(),
+      author: { role: 'user' },
+      create_time: Date.now() / 1000,
+      content,
+      metadata: {
+        developer_mode_connector_ids: [],
+        selected_github_repos: [],
+        selected_all_github_repos: false,
+        system_hints: ['picture_v2'],
+        serialization_metadata: { custom_symbol_offsets: [] }
+      }
+    };
+
+    // 如果有图片，添加 attachments
+    if (uploadedImages.length > 0) {
+      message.attachments = buildAttachments(uploadedImages);
+    }
+
     const payload = {
       action: 'next',
-      messages: [
-        {
-          id: uuidv4(),
-          author: { role: 'user' },
-          create_time: Date.now() / 1000,
-          content: { content_type: 'text', parts: [prompt] },
-          metadata: {
-            developer_mode_connector_ids: [],
-            selected_github_repos: [],
-            selected_all_github_repos: false,
-            system_hints: ['picture_v2'],
-            serialization_metadata: { custom_symbol_offsets: [] }
-          }
-        }
-      ],
+      messages: [message],
       parent_message_id: uuidv4(),
       model: officialImageModelSlug(model),
       client_prepare_state: 'sent',
@@ -472,6 +493,7 @@ class OfficialImageClient {
         app_name: 'chatgpt.com'
       }
     };
+
     const response = await this.fetchUpstream(CHATGPT_API_BASE + targetPath, {
       method: 'POST',
       headers: this.officialHeaders(targetPath, reqs, conduitToken, 'text/event-stream'),
@@ -729,17 +751,44 @@ class OfficialImageClient {
       mimeType: contentType
     };
   }
+
   async generate(prompt, options = {}) {
     const trimmed = String(prompt || '').trim();
     if (!trimmed) throw new Error('prompt is required');
-    if (!this.accessToken) throw new Error('账号缺少 access_token');
+    if (!this.accessToken) throw new Error('账号缺少 session_token 或 access_token');
+
+    // 如果有输入图片，先上传
+    let uploadedImages = [];
+    if (options.inputImages && Array.isArray(options.inputImages)) {
+      console.log(`📤 上传 ${options.inputImages.length} 张输入图片到 ChatGPT...`);
+      for (let i = 0; i < options.inputImages.length; i++) {
+        const img = options.inputImages[i];
+        const fileName = img.fileName || `image_${i + 1}.png`;
+        const contentType = img.contentType || 'image/png';
+
+        // 使用专门的上传模块
+        const uploaded = await uploadImageToChat(
+          img.data,
+          fileName,
+          contentType,
+          this.accessToken,
+          (url, opts) => this.fetchUpstream(url, opts),
+          (path) => this.officialHeaders(path, {}, null, 'application/json')
+        );
+        uploadedImages.push(uploaded);
+      }
+      console.log(`✅ 所有图片上传完成`);
+    }
 
     const streamPrompt = buildOfficialImagePrompt(trimmed, options.size, options.quality, options.resolution);
 
     await this.bootstrap();
     const reqs = await this.getChatRequirements();
-    const conduitToken = await this.prepareConversation(streamPrompt, reqs, options.model);
-    const response = await this.startConversation(streamPrompt, reqs, conduitToken, options.model);
+
+    // 修改 prepareConversation 和 startConversation 调用
+    const conduitToken = await this.prepareConversation(streamPrompt, reqs, options.model, uploadedImages);
+    const response = await this.startConversation(streamPrompt, reqs, conduitToken, options.model, uploadedImages);
+
     const state = await this.parseStream(response);
     this.lastConversationId = state.conversationId;
 
@@ -847,23 +896,70 @@ async function saveImage(buffer, _uploadDir, index) {
  * @returns {Promise<Array<{url:string, revisedPrompt:string, outputFormat:string}>>}
  */
 export async function generateImage(prompt, account, options = {}, uploadDir = 'uploads') {
-  // Inject reference image hints into prompt for official route
-  let finalPrompt = String(prompt || '').trim();
-  if (Array.isArray(options.reference_images) && options.reference_images.length > 0) {
-    const refNames = options.reference_images.map((ref, i) => `参考图${i + 1}`).join('、');
-    finalPrompt = `【${refNames}已上传，请以上传的图片作为参考/风格依据进行创作】\n\n${finalPrompt}`;
-  }
-
   console.log('\n========================================');
   console.log('🎨 开始生成图片 (官方 f/conversation 链路)');
-  console.log(`📝 提示词: ${String(finalPrompt).slice(0, 80)}`);
+  console.log(`📝 提示词: ${String(prompt).slice(0, 80)}`);
   console.log(`🔑 账号: ${account?.email}`);
   console.log(`⚙️  参数: model=${options.model}, size=${options.size}`);
+
+  // 处理参考图片
+  let inputImages = [];
+  if (Array.isArray(options.reference_images) && options.reference_images.length > 0) {
+    console.log(`📤 检测到 ${options.reference_images.length} 张参考图片，开始下载...`);
+
+    const fetchModule = await import('node-fetch');
+    const fetchFn = fetchModule.default;
+
+    for (let i = 0; i < options.reference_images.length; i++) {
+      const imageUrl = options.reference_images[i];
+      try {
+        console.log(`📥 下载参考图 ${i + 1}: ${imageUrl}`);
+        const response = await fetchFn(imageUrl);
+        if (!response.ok) {
+          console.warn(`⚠️ 下载参考图 ${i + 1} 失败: ${response.status}`);
+          continue;
+        }
+
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        // 检测图片格式
+        let contentType = 'image/png';
+        let extension = 'png';
+        if (buffer[0] === 0xFF && buffer[1] === 0xD8) {
+          contentType = 'image/jpeg';
+          extension = 'jpg';
+        } else if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) {
+          contentType = 'image/webp';
+          extension = 'webp';
+        }
+
+        inputImages.push({
+          data: buffer,
+          contentType,
+          fileName: `reference_${i + 1}.${extension}`
+        });
+
+        console.log(`✅ 参考图 ${i + 1} 下载成功 (${buffer.length} bytes, ${contentType})`);
+      } catch (err) {
+        console.error(`❌ 下载参考图 ${i + 1} 失败:`, err.message);
+      }
+    }
+
+    if (inputImages.length > 0) {
+      console.log(`✅ 成功准备 ${inputImages.length} 张参考图片`);
+    }
+  }
+
   console.log('========================================\n');
 
   const client = new OfficialImageClient(account);
   try {
-    const imageIDs = await client.generate(finalPrompt, options);
+    // 传递参考图片给 generate 方法
+    const imageIDs = await client.generate(prompt, {
+      ...options,
+      inputImages: inputImages.length > 0 ? inputImages : undefined
+    });
 
     const results = [];
     for (let i = 0; i < imageIDs.length; i++) {

@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Sun, Moon } from 'lucide-react'
+import { Sun, Moon, X } from 'lucide-react'
 import './LoginPage.css'
 
 const API_BASE = 'http://localhost:8000'
 
-function LoginPage({ onLogin, onEmailLogin, theme, onThemeChange }) {
+function LoginPage({ onLogin, onEmailLogin, theme, onThemeChange, modal = false, onClose }) {
   const [authMode, setAuthMode] = useState('login') // 'login' | 'register' | 'forgot'
   const [loginType, setLoginType] = useState('password') // 'password' | 'email'
   const [forgotStep, setForgotStep] = useState(1)
@@ -202,7 +202,7 @@ function LoginPage({ onLogin, onEmailLogin, theme, onThemeChange }) {
   )
 
   return (
-    <div className={`login-page ${theme}`}>
+    <div className={`login-page ${theme} ${modal ? 'modal' : ''}`}>
       <button className="theme-toggle-btn" onClick={onThemeChange}>
         {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
       </button>
@@ -220,6 +220,11 @@ function LoginPage({ onLogin, onEmailLogin, theme, onThemeChange }) {
         className="login-container"
       >
         <div className="login-card">
+          {modal && onClose && (
+            <button type="button" className="modal-close-btn" onClick={onClose} aria-label="关闭登录窗口">
+              <X size={18} />
+            </button>
+          )}
           <div className="login-header">
             <div className="sign-in-label">{hc.label}</div>
             <h1 className="login-title">{hc.title}</h1>
@@ -397,9 +402,6 @@ function LoginPage({ onLogin, onEmailLogin, theme, onThemeChange }) {
             <div className="login-footer">
               <p className="register-hint">
                 还没有账号？<button type="button" className="register-link" onClick={() => switchMode('register')}>立即注册</button>
-              </p>
-              <p className="login-hint">
-                登录后同时绑定你统筹续订账阅和帐面信
               </p>
             </div>
           )}

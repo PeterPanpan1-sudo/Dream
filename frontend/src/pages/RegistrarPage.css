@@ -1,0 +1,559 @@
+.registrar-page {
+  max-width: 1480px;
+  margin: 0 auto;
+  padding-bottom: 48px;
+}
+
+.registrar-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: flex-start;
+  margin-bottom: 24px;
+}
+
+.registrar-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 32px;
+  font-weight: 800;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.registrar-header p {
+  max-width: 760px;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+.registrar-header p span {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.registrar-refresh-btn,
+.registrar-primary-btn,
+.registrar-secondary-btn,
+.selected-mailbox-card button,
+.signal-card button,
+.signal-card a,
+.mail-signals button,
+.registrar-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  font-weight: 650;
+  transition: all 0.2s ease;
+}
+
+.registrar-refresh-btn,
+.registrar-secondary-btn {
+  padding: 11px 18px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.registrar-refresh-btn:hover,
+.registrar-secondary-btn:hover,
+.selected-mailbox-card button:hover,
+.signal-card button:hover,
+.signal-card a:hover,
+.mail-signals button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.registrar-primary-btn {
+  width: 100%;
+  padding: 13px 20px;
+  background: linear-gradient(135deg, var(--accent), #8b5cf6);
+  color: white;
+  box-shadow: 0 12px 26px rgba(99, 102, 241, 0.28);
+}
+
+.registrar-primary-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.registrar-primary-btn:disabled,
+.registrar-secondary-btn:disabled,
+.registrar-refresh-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.registrar-message {
+  padding: 14px 18px;
+  border-radius: 14px;
+  margin-bottom: 20px;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.registrar-message.success {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #10b981;
+}
+
+.registrar-message.error {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #ef4444;
+}
+
+.registrar-config-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.registrar-config-card,
+.registrar-panel,
+.selected-mailbox-card,
+.signal-card,
+.registrar-warning,
+.mail-card {
+  background: var(--glass-bg);
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 30px var(--shadow);
+  backdrop-filter: blur(20px);
+}
+
+.registrar-config-card {
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.registrar-config-card span,
+.selected-mailbox-card span,
+.signal-card span {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.registrar-config-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.registrar-config-card strong.ok {
+  color: #10b981;
+}
+
+.registrar-config-card strong.missing {
+  color: #ef4444;
+}
+
+.registrar-warning {
+  border-radius: 14px;
+  padding: 14px 16px;
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.32);
+  margin-bottom: 18px;
+  line-height: 1.7;
+}
+
+.registrar-warning code {
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--bg-tertiary);
+}
+
+.registrar-layout {
+  display: grid;
+  grid-template-columns: minmax(340px, 0.85fr) minmax(540px, 1.45fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.registrar-panel {
+  border-radius: 22px;
+  padding: 24px;
+}
+
+.registrar-create-panel {
+  position: sticky;
+  top: 24px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.panel-title.with-actions {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.panel-title-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.panel-title.compact {
+  margin-bottom: 14px;
+}
+
+.panel-title svg {
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.panel-title h3 {
+  color: var(--text);
+  font-size: 19px;
+  font-weight: 800;
+  margin-bottom: 5px;
+}
+
+.panel-title p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.registrar-form,
+.registrar-account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.registrar-form label,
+.registrar-account-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.registrar-form input,
+.registrar-account-form textarea,
+.registrar-account-form select {
+  width: 100%;
+  padding: 12px 14px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  font: inherit;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.registrar-account-form textarea {
+  resize: vertical;
+  min-height: 92px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.registrar-form input:focus,
+.registrar-account-form textarea:focus,
+.registrar-account-form select:focus {
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+.registrar-checkbox {
+  flex-direction: row !important;
+  align-items: center;
+  color: var(--text-secondary) !important;
+}
+
+.registrar-checkbox input {
+  width: auto;
+  accent-color: var(--accent);
+}
+
+.registrar-workflow {
+  margin-top: 22px;
+  padding: 16px;
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  background: var(--bg-tertiary);
+}
+
+.registrar-workflow h4 {
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.registrar-workflow ol {
+  padding-left: 18px;
+  color: var(--text-secondary);
+  line-height: 1.75;
+  font-size: 13px;
+}
+
+.registrar-workflow b {
+  color: var(--accent);
+}
+
+.registrar-mailbox-list {
+  margin-top: 22px;
+}
+
+.list-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.list-title h3 {
+  color: var(--text);
+  font-size: 17px;
+}
+
+.list-title span {
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-tertiary);
+  color: var(--accent);
+  font-weight: 800;
+}
+
+.mailbox-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.mailbox-item:hover,
+.mailbox-item.active {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.mailbox-item span {
+  color: var(--accent);
+  font-weight: 800;
+  word-break: break-all;
+}
+
+.mailbox-item small {
+  color: var(--text-secondary);
+}
+
+.selected-mailbox-card {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  border-radius: 16px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.selected-mailbox-card strong {
+  color: var(--accent);
+  font-size: 18px;
+  word-break: break-all;
+}
+
+.selected-mailbox-card button,
+.signal-card button,
+.signal-card a,
+.mail-signals button {
+  padding: 9px 12px;
+  color: var(--text);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.registrar-signal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.signal-card {
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.signal-card strong {
+  display: block;
+  color: var(--text);
+  font-size: 24px;
+  margin-bottom: 12px;
+  word-break: break-all;
+}
+
+.link-card strong {
+  font-size: 18px;
+}
+
+.signal-actions,
+.registrar-actions-row,
+.mail-signals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.registrar-actions-row {
+  margin-bottom: 20px;
+}
+
+.registrar-account-form {
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary);
+  margin-bottom: 22px;
+}
+
+.mail-list {
+  margin-top: 8px;
+}
+
+.mail-card {
+  border-radius: 16px;
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.mail-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+.mail-card-header strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.mail-card-header small,
+.mail-from,
+.mail-card p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.mail-from {
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.mail-signals {
+  margin-top: 12px;
+}
+
+.registrar-empty {
+  padding: 26px;
+  color: var(--text-secondary);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  background: var(--bg-tertiary);
+}
+
+.registrar-empty.big {
+  min-height: 320px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.registrar-icon-btn {
+  width: 36px;
+  height: 36px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.registrar-icon-btn.danger:hover {
+  border-color: #ef4444;
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+
+.spinning {
+  animation: registrar-spin 0.9s linear infinite;
+}
+
+@keyframes registrar-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 1180px) {
+  .registrar-config-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .registrar-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .registrar-create-panel {
+    position: static;
+  }
+}
+
+@media (max-width: 720px) {
+  .registrar-header,
+  .selected-mailbox-card,
+  .mail-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .registrar-config-grid,
+  .registrar-signal-grid {
+    grid-template-columns: 1fr;
+  }
+}

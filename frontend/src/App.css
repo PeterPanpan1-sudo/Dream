@@ -272,6 +272,11 @@
   background: rgba(239, 68, 68, 0.1);
 }
 
+.login-entry-btn:hover {
+  color: var(--accent);
+  background: var(--accent-light);
+}
+
 .user-info {
   display: flex;
   align-items: center;
@@ -281,6 +286,11 @@
   border-radius: 12px;
   background: var(--bg-tertiary);
   transition: all 0.2s;
+}
+
+.guest-user-info {
+  border: 1px solid var(--border);
+  background: linear-gradient(135deg, var(--bg-tertiary), var(--accent-light));
 }
 
 .sidebar.collapsed .user-info {

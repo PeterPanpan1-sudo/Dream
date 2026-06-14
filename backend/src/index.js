@@ -10,8 +10,10 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import multer from 'multer';
 import nodemailer from 'nodemailer';
+import fetch from 'node-fetch';
 import * as codexClient from './chatgpt-client.js';
 import * as officialClient from './chatgpt-official-client.js';
+import * as textClient from './chatgpt-text-client.js';
 import { uploadToR2, deleteFromR2, listR2Objects } from './r2.js';
 
 dotenv.config();
@@ -94,25 +96,6 @@ const initDB = async () => {
       email TEXT,
       role TEXT DEFAULT 'user',
       status TEXT DEFAULT 'active',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  db.run(`
-    CREATE TABLE IF NOT EXISTS accounts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL,
-      password TEXT,
-      access_token TEXT,
-      refresh_token TEXT,
-      expires_at DATETIME,
-      type TEXT DEFAULT 'free',
-      status TEXT DEFAULT 'active',
-      quota INTEGER DEFAULT 0,
-      used_count INTEGER DEFAULT 0,
-      recovery_time DATETIME,
-      last_used_at DATETIME,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -217,6 +200,40 @@ const initDB = async () => {
   `);
   saveDB();
 
+  // Create text prompt optimization history table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS text_conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      prompt TEXT NOT NULL,
+      response TEXT NOT NULL,
+      model TEXT DEFAULT 'gpt-5.5',
+      cost INTEGER DEFAULT 5,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  saveDB();
+
+  // Create Cloudflare temp-mail registrar mailbox table
+  db.run(`
+    CREATE TABLE IF NOT EXISTS registrar_mailboxes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      name TEXT,
+      domain TEXT,
+      mail_jwt TEXT,
+      provider TEXT DEFAULT 'cloudflare-temp-mail',
+      status TEXT DEFAULT 'created',
+      verification_code TEXT,
+      verification_link TEXT,
+      last_mail_at DATETIME,
+      created_by INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  saveDB();
+
   // Migrate: add nickname column to users if missing
   try {
     db.exec("SELECT nickname FROM users LIMIT 1");
@@ -259,7 +276,7 @@ const initDB = async () => {
   if (usersWithoutCode.length > 0) saveDB();
 
   // Auto-recover accounts whose cooldown has expired
-  db.run("UPDATE accounts SET status = 'active', recovery_time = NULL WHERE status = 'limited' AND recovery_time IS NOT NULL AND recovery_time < datetime('now')");
+  db.run("UPDATE chatgpt_accounts SET status = 'active', cooldown_until = NULL WHERE status = 'limited' AND cooldown_until IS NOT NULL AND cooldown_until < datetime('now')");
   saveDB();
 
   // Create default admin user
@@ -284,7 +301,7 @@ const initDB = async () => {
     {
       name: 'admin',
       description: '管理员',
-      permissions: JSON.stringify(['home', 'create', 'gallery', 'account', 'settings', 'admin-users', 'admin-accounts', 'admin-roles', 'admin-logs'])
+      permissions: JSON.stringify(['home', 'create', 'gallery', 'account', 'settings', 'admin-users', 'admin-accounts', 'admin-registrar', 'admin-roles', 'admin-logs'])
     },
     {
       name: 'user',
@@ -471,6 +488,17 @@ app.post('/api/auth/verify-code', (req, res) => {
   ]);
   saveDB();
 
+  // 获取角色的权限信息
+  const roleInfo = getOne('SELECT permissions FROM roles WHERE name = ?', [user.role]);
+  let permissions = ['home', 'create', 'gallery', 'account', 'settings'];
+  if (roleInfo && roleInfo.permissions) {
+    try {
+      permissions = JSON.parse(roleInfo.permissions);
+    } catch (e) {
+      permissions = ['home', 'create', 'gallery', 'account', 'settings'];
+    }
+  }
+
   res.json({
     token,
     isNewUser,
@@ -481,7 +509,8 @@ app.post('/api/auth/verify-code', (req, res) => {
       email: user.email,
       role: user.role,
       invite_code: user.invite_code,
-      created_at: user.created_at
+      created_at: user.created_at,
+      permissions
     }
   });
 });
@@ -553,13 +582,25 @@ app.post('/api/auth/login', (req, res) => {
   ]);
   saveDB();
 
+  // 获取角色的权限信息
+  const roleInfo = getOne('SELECT permissions FROM roles WHERE name = ?', [user.role]);
+  let permissions = ['home', 'create', 'gallery', 'account', 'settings'];
+  if (roleInfo && roleInfo.permissions) {
+    try {
+      permissions = JSON.parse(roleInfo.permissions);
+    } catch (e) {
+      permissions = ['home', 'create', 'gallery', 'account', 'settings'];
+    }
+  }
+
   res.json({
     token,
     user: {
       id: user.id,
       username: user.username,
       email: user.email,
-      role: user.role
+      role: user.role,
+      permissions
     }
   });
 });
@@ -880,6 +921,558 @@ app.delete('/api/admin/accounts/:id', authenticateToken, requireAdmin, (req, res
   res.json({ success: true, message: '账号已删除' });
 });
 
+// ==================== Cloudflare 临时邮箱注册机 ====================
+
+const getTempMailConfig = () => {
+  const workerUrl = String(
+    process.env.TEMP_MAIL_WORKER_URL
+    || process.env.CLOUDFLARE_TEMP_MAIL_URL
+    || ''
+  ).trim().replace(/\/+$/, '');
+  const adminAuth = String(
+    process.env.TEMP_MAIL_ADMIN_AUTH
+    || process.env.CLOUDFLARE_TEMP_MAIL_ADMIN_AUTH
+    || ''
+  ).trim();
+  const domain = String(process.env.TEMP_MAIL_DOMAIN || 'edu.peterlinux.com').trim().toLowerCase();
+  const enablePrefix = String(process.env.TEMP_MAIL_ENABLE_PREFIX ?? 'true').toLowerCase() !== 'false';
+
+  return { workerUrl, adminAuth, domain, enablePrefix };
+};
+
+const maskSecret = (value = '') => {
+  const text = String(value || '');
+  if (!text) return '';
+  if (text.length <= 8) return `${text.slice(0, 2)}****`;
+  return `${text.slice(0, 4)}****${text.slice(-4)}`;
+};
+
+const publicTempMailConfig = () => {
+  const config = getTempMailConfig();
+  return {
+    configured: Boolean(config.workerUrl && config.adminAuth),
+    workerUrlConfigured: Boolean(config.workerUrl),
+    adminAuthConfigured: Boolean(config.adminAuth),
+    workerUrl: config.workerUrl,
+    adminAuthMasked: maskSecret(config.adminAuth),
+    domain: config.domain,
+    enablePrefix: config.enablePrefix
+  };
+};
+
+const createHttpError = (message, status = 500, details = null) => {
+  const err = new Error(message);
+  err.status = status;
+  err.details = details;
+  return err;
+};
+
+const buildTempMailUrl = (pathName, query = {}) => {
+  const { workerUrl } = getTempMailConfig();
+  const endpoint = `${workerUrl}${pathName.startsWith('/') ? pathName : `/${pathName}`}`;
+  const url = new URL(endpoint);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+};
+
+const parseMaybeJson = (text) => {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+};
+
+const assertTempMailConfigured = () => {
+  const config = getTempMailConfig();
+  if (!config.workerUrl || !config.adminAuth) {
+    throw createHttpError('Cloudflare 临时邮箱未配置，请在后端 .env 中配置 TEMP_MAIL_WORKER_URL 和 TEMP_MAIL_ADMIN_AUTH', 500);
+  }
+  return config;
+};
+
+const callTempMailAdmin = async (pathName, { method = 'GET', body = null, query = {} } = {}) => {
+  assertTempMailConfigured();
+  const { adminAuth } = getTempMailConfig();
+  const response = await fetch(buildTempMailUrl(pathName, query), {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/plain, */*',
+      'x-admin-auth': adminAuth
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const rawText = await response.text();
+  const data = parseMaybeJson(rawText);
+
+  if (!response.ok) {
+    const message = data?.error || data?.message || rawText || `临时邮箱管理接口请求失败 (${response.status})`;
+    throw createHttpError(message, response.status, data);
+  }
+
+  return data;
+};
+
+const callTempMailMailbox = async (mailJwt, pathName, { method = 'GET', body = null, query = {} } = {}) => {
+  assertTempMailConfigured();
+  if (!mailJwt) {
+    throw createHttpError('该邮箱缺少地址 JWT，无法读取邮件', 400);
+  }
+
+  const response = await fetch(buildTempMailUrl(pathName, query), {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/plain, */*',
+      'Authorization': `Bearer ${mailJwt}`
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const rawText = await response.text();
+  const data = parseMaybeJson(rawText);
+
+  if (!response.ok) {
+    const message = data?.error || data?.message || rawText || `临时邮箱邮件接口请求失败 (${response.status})`;
+    throw createHttpError(message, response.status, data);
+  }
+
+  return data;
+};
+
+const sanitizeMailboxName = (name = '') => String(name || '')
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9._-]/g, '')
+  .replace(/^[._-]+|[._-]+$/g, '')
+  .slice(0, 64);
+
+const randomMailboxName = () => `dd${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`;
+
+const sanitizeDomain = (domain = '') => String(domain || '')
+  .trim()
+  .toLowerCase()
+  .replace(/^@+/, '')
+  .replace(/[^a-z0-9.-]/g, '');
+
+const findDeepValue = (value, keys = []) => {
+  const keySet = new Set(keys.map(key => key.toLowerCase()));
+  const seen = new Set();
+
+  const visit = (current) => {
+    if (!current || typeof current !== 'object' || seen.has(current)) return null;
+    seen.add(current);
+
+    for (const [key, child] of Object.entries(current)) {
+      if (keySet.has(key.toLowerCase()) && child !== undefined && child !== null && child !== '') {
+        return child;
+      }
+    }
+
+    for (const child of Array.isArray(current) ? current : Object.values(current)) {
+      const found = visit(child);
+      if (found !== null && found !== undefined && found !== '') return found;
+    }
+    return null;
+  };
+
+  return visit(value);
+};
+
+const extractEmailFromResponse = (data, fallbackEmail) => {
+  const direct = findDeepValue(data, ['email', 'address', 'mail', 'mailAddress']);
+  const text = typeof direct === 'string' ? direct : JSON.stringify(data || '');
+  const match = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0].toLowerCase() : fallbackEmail.toLowerCase();
+};
+
+const extractJwtFromResponse = (data) => {
+  const direct = findDeepValue(data, ['jwt', 'token', 'addressJwt', 'address_jwt', 'accessToken', 'access_token', 'password']);
+  const directText = typeof direct === 'string' ? direct.trim() : '';
+  if (directText) return directText;
+
+  const text = typeof data === 'string' ? data : JSON.stringify(data || '');
+  const jwtMatch = text.match(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/);
+  return jwtMatch ? jwtMatch[0] : '';
+};
+
+const redactTempMailResponse = (value) => {
+  const secretKeys = new Set(['jwt', 'token', 'addressjwt', 'address_jwt', 'accesstoken', 'access_token', 'password']);
+  if (Array.isArray(value)) return value.map(redactTempMailResponse);
+  if (!value || typeof value !== 'object') return value;
+
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+    if (secretKeys.has(key.toLowerCase())) return [key, maskSecret(child)];
+    return [key, redactTempMailResponse(child)];
+  }));
+};
+
+const normalizeTempMailItems = (data) => {
+  if (Array.isArray(data)) return data;
+  const candidates = [
+    data?.items,
+    data?.mails,
+    data?.mail,
+    data?.messages,
+    data?.results,
+    data?.data,
+    data?.data?.items,
+    data?.data?.mails,
+    data?.data?.messages,
+    data?.data?.results
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  if (data && typeof data === 'object') {
+    const arrayValue = Object.values(data).find(Array.isArray);
+    if (arrayValue) return arrayValue;
+  }
+
+  return [];
+};
+
+const decodeQuotedPrintable = (text = '') => {
+  const input = String(text || '').replace(/=\r?\n/g, '');
+  const binary = input.replace(/=([A-Fa-f0-9]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+
+  try {
+    const decoded = Buffer.from(binary, 'binary').toString('utf8');
+    return decoded.includes('�') ? binary : decoded;
+  } catch {
+    return binary;
+  }
+};
+
+const decodeMimeWords = (text = '') => String(text || '').replace(/=\?([^?]+)\?([BQ])\?([^?]+)\?=/gi, (_, charset, encoding, payload) => {
+  try {
+    if (encoding.toUpperCase() === 'B') {
+      return Buffer.from(payload, 'base64').toString(charset.toLowerCase().includes('gb') ? 'latin1' : 'utf8');
+    }
+    const qp = payload.replace(/_/g, ' ');
+    return decodeQuotedPrintable(qp);
+  } catch {
+    return payload;
+  }
+});
+
+const decodeHtmlEntities = (text = '') => String(text || '')
+  .replace(/&amp;/g, '&')
+  .replace(/&lt;/g, '<')
+  .replace(/&gt;/g, '>')
+  .replace(/&quot;/g, '"')
+  .replace(/&#39;/g, "'");
+
+const extractHeader = (raw = '', headerName = '') => {
+  const escaped = headerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = String(raw || '').match(new RegExp(`^${escaped}:\\s*([\\s\\S]*?)(?:\\r?\\n(?![\\t ])|$)`, 'im'));
+  if (!match) return '';
+  return decodeMimeWords(match[1].replace(/\r?\n[\t ]+/g, ' ').trim());
+};
+
+const normalizeMailText = (value = '') => decodeHtmlEntities(decodeQuotedPrintable(decodeMimeWords(String(value || ''))))
+  .replace(/\\u003d/g, '=')
+  .replace(/\\u0026/g, '&')
+  .replace(/=3D/gi, '=')
+  .replace(/=26/gi, '&');
+
+const getMailRawText = (item) => {
+  if (!item) return '';
+  if (typeof item === 'string') return item;
+  return item.raw || item.rawText || item.text || item.html || item.content || item.body || item.source || JSON.stringify(item);
+};
+
+const extractVerificationSignalsFromText = (text = '') => {
+  const normalized = normalizeMailText(text)
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const codeRegexes = [
+    /(?:verification|verify|confirm(?:ation)?|security|login|one-time|temporary|auth(?:entication)?|code|验证码|校验码|确认码|临时|安全)[^0-9]{0,160}(\d{6})/ig,
+    /(\d{3})\s*[\-–— ]\s*(\d{3})/g,
+    /\b(\d{6})\b/g
+  ];
+  let code = '';
+  for (const regex of codeRegexes) {
+    const matches = [...normalized.matchAll(regex)];
+    if (matches.length > 0) {
+      const first = matches[0];
+      const compact = first.length >= 3 && first[1] && first[2]
+        ? `${first[1]}${first[2]}`
+        : (first[1] || first[0]).replace(/\D/g, '');
+      if (/^\d{6}$/.test(compact)) {
+        code = compact;
+        break;
+      }
+    }
+  }
+
+  const links = normalized.match(/https?:\/\/[^\s"'<>）)]+/g) || [];
+  const cleanLinks = links.map(link => link.replace(/[.,;]+$/g, '').replace(/&amp;/g, '&'));
+  const link = cleanLinks.find(item => /openai|chatgpt|auth0|oaistatic/i.test(item)) || cleanLinks[0] || '';
+
+  return { code, link, text: normalized };
+};
+
+const formatTempMailItem = (item) => {
+  const raw = getMailRawText(item);
+  const normalized = normalizeMailText(raw);
+  const signals = extractVerificationSignalsFromText([
+    item?.subject,
+    item?.from,
+    item?.sender,
+    normalized
+  ].filter(Boolean).join('\n'));
+
+  return {
+    id: item?.id || item?.messageId || item?.message_id || item?.uid || item?.key || crypto.createHash('sha1').update(normalized).digest('hex').slice(0, 16),
+    subject: decodeMimeWords(item?.subject || extractHeader(raw, 'Subject') || ''),
+    from: decodeMimeWords(item?.from || item?.sender || extractHeader(raw, 'From') || ''),
+    to: decodeMimeWords(item?.to || item?.recipient || extractHeader(raw, 'To') || ''),
+    date: item?.date || item?.created_at || item?.createdAt || extractHeader(raw, 'Date') || '',
+    code: signals.code,
+    link: signals.link,
+    preview: normalized.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 260),
+    raw: normalized.slice(0, 12000)
+  };
+};
+
+const extractVerificationSignals = (items = []) => {
+  for (const item of items) {
+    if (item.code || item.link) {
+      return {
+        code: item.code || '',
+        link: item.link || '',
+        mailId: item.id,
+        subject: item.subject,
+        from: item.from,
+        date: item.date
+      };
+    }
+  }
+  return { code: '', link: '' };
+};
+
+const safeRegistrarMailbox = (mailbox) => mailbox ? {
+  id: mailbox.id,
+  email: mailbox.email,
+  name: mailbox.name,
+  domain: mailbox.domain,
+  provider: mailbox.provider,
+  status: mailbox.status,
+  verification_code: mailbox.verification_code,
+  verification_link: mailbox.verification_link,
+  last_mail_at: mailbox.last_mail_at,
+  created_by: mailbox.created_by,
+  created_at: mailbox.created_at,
+  updated_at: mailbox.updated_at,
+  hasMailJwt: Boolean(mailbox.mail_jwt)
+} : null;
+
+const resolveRegistrarMailbox = ({ id, email }) => {
+  if (id) return getOne('SELECT * FROM registrar_mailboxes WHERE id = ?', [id]);
+  if (email) return getOne('SELECT * FROM registrar_mailboxes WHERE email = ?', [String(email).trim().toLowerCase()]);
+  return null;
+};
+
+const saveRegistrarSignals = (mailbox, signals) => {
+  if (!mailbox || (!signals.code && !signals.link)) return;
+  db.run(
+    `UPDATE registrar_mailboxes
+     SET verification_code = ?, verification_link = ?, last_mail_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [signals.code || mailbox.verification_code || null, signals.link || mailbox.verification_link || null, mailbox.id]
+  );
+  saveDB();
+};
+
+app.get('/api/admin/registrar/config', authenticateToken, requireAdmin, (req, res) => {
+  res.json(publicTempMailConfig());
+});
+
+app.get('/api/admin/registrar/mailboxes', authenticateToken, requireAdmin, (req, res) => {
+  const rows = getAll(`
+    SELECT * FROM registrar_mailboxes
+    ORDER BY created_at DESC, id DESC
+    LIMIT 100
+  `);
+  res.json({ items: rows.map(safeRegistrarMailbox), total: rows.length });
+});
+
+app.post('/api/admin/registrar/address', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const config = assertTempMailConfigured();
+    const name = sanitizeMailboxName(req.body?.name) || randomMailboxName();
+    const domain = sanitizeDomain(req.body?.domain) || config.domain;
+    const enablePrefix = req.body?.enablePrefix === undefined ? config.enablePrefix : Boolean(req.body.enablePrefix);
+
+    if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(name)) {
+      return res.status(400).json({ error: '邮箱名称只能包含小写字母、数字、点、下划线和横线，长度 2-64 位' });
+    }
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(domain)) {
+      return res.status(400).json({ error: '邮箱域名格式不正确' });
+    }
+
+    const remote = await callTempMailAdmin('/admin/new_address', {
+      method: 'POST',
+      body: { enablePrefix, name, domain }
+    });
+
+    const fallbackEmail = `${name}@${domain}`;
+    const email = extractEmailFromResponse(remote, fallbackEmail);
+    const mailJwt = extractJwtFromResponse(remote);
+
+    if (!mailJwt) {
+      throw createHttpError('临时邮箱接口未返回地址 JWT，无法后续读取邮件', 502, redactTempMailResponse(remote));
+    }
+
+    db.run(
+      `INSERT INTO registrar_mailboxes (email, name, domain, mail_jwt, provider, status, created_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(email) DO UPDATE SET
+         name = excluded.name,
+         domain = excluded.domain,
+         mail_jwt = excluded.mail_jwt,
+         status = excluded.status,
+         updated_at = CURRENT_TIMESTAMP`,
+      [email, name, domain, mailJwt, 'cloudflare-temp-mail', 'created', req.user.id]
+    );
+    saveDB();
+
+    const mailbox = getOne('SELECT * FROM registrar_mailboxes WHERE email = ?', [email]);
+    db.run('INSERT INTO logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)', [
+      req.user.id,
+      'registrar_create_mailbox',
+      `Created temp mailbox: ${email}`,
+      req.ip
+    ]);
+    saveDB();
+
+    res.json({
+      success: true,
+      mailbox: safeRegistrarMailbox(mailbox),
+      remote: redactTempMailResponse(remote)
+    });
+  } catch (err) {
+    console.error('Registrar create address error:', err);
+    res.status(err.status || 500).json({ error: err.message || '创建临时邮箱失败', details: err.details ? redactTempMailResponse(err.details) : undefined });
+  }
+});
+
+app.get('/api/admin/registrar/mails', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const mailbox = resolveRegistrarMailbox({ id: req.query.mailboxId || req.query.id, email: req.query.email });
+    if (!mailbox) return res.status(404).json({ error: '邮箱记录不存在，请先创建临时邮箱' });
+
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+    const remote = await callTempMailMailbox(mailbox.mail_jwt, '/api/mails', { query: { limit, offset } });
+    const items = normalizeTempMailItems(remote).map(formatTempMailItem);
+    const signals = extractVerificationSignals(items);
+    saveRegistrarSignals(mailbox, signals);
+
+    const updatedMailbox = getOne('SELECT * FROM registrar_mailboxes WHERE id = ?', [mailbox.id]);
+    res.json({
+      mailbox: safeRegistrarMailbox(updatedMailbox),
+      items,
+      total: items.length,
+      signals,
+      remote: redactTempMailResponse(remote)
+    });
+  } catch (err) {
+    console.error('Registrar mails error:', err);
+    res.status(err.status || 500).json({ error: err.message || '读取临时邮箱邮件失败', details: err.details ? redactTempMailResponse(err.details) : undefined });
+  }
+});
+
+app.post('/api/admin/registrar/extract-code', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const mailbox = resolveRegistrarMailbox({ id: req.body?.mailboxId || req.body?.id, email: req.body?.email });
+    if (!mailbox) return res.status(404).json({ error: '邮箱记录不存在，请先创建临时邮箱' });
+
+    const limit = Math.min(50, Math.max(1, parseInt(req.body?.limit, 10) || 20));
+    const offset = Math.max(0, parseInt(req.body?.offset, 10) || 0);
+    const remote = await callTempMailMailbox(mailbox.mail_jwt, '/api/mails', { query: { limit, offset } });
+    const items = normalizeTempMailItems(remote).map(formatTempMailItem);
+    const signals = extractVerificationSignals(items);
+    saveRegistrarSignals(mailbox, signals);
+
+    const updatedMailbox = getOne('SELECT * FROM registrar_mailboxes WHERE id = ?', [mailbox.id]);
+    res.json({ success: Boolean(signals.code || signals.link), mailbox: safeRegistrarMailbox(updatedMailbox), signals, items });
+  } catch (err) {
+    console.error('Registrar extract-code error:', err);
+    res.status(err.status || 500).json({ error: err.message || '提取验证码失败', details: err.details ? redactTempMailResponse(err.details) : undefined });
+  }
+});
+
+app.post('/api/admin/registrar/save-account', authenticateToken, requireAdmin, (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const sessionToken = String(req.body?.session_token || '').trim();
+  const accessToken = String(req.body?.access_token || '').trim();
+  const status = ['active', 'limited', 'invalid'].includes(req.body?.status) ? req.body.status : 'active';
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: '请提供有效邮箱' });
+  }
+
+  const existing = getOne('SELECT id FROM chatgpt_accounts WHERE email = ?', [email]);
+  if (!existing && !sessionToken) {
+    return res.status(400).json({ error: '新账号必须填写 session_token，才能加入 ChatGPT 账号池' });
+  }
+
+  if (existing) {
+    const updates = ['status = ?', 'updated_at = CURRENT_TIMESTAMP'];
+    const values = [status];
+    if (sessionToken) {
+      updates.push('session_token = ?');
+      values.push(sessionToken);
+    }
+    if (accessToken) {
+      updates.push('access_token = ?');
+      values.push(accessToken);
+    }
+    values.push(existing.id);
+    db.run(`UPDATE chatgpt_accounts SET ${updates.join(', ')} WHERE id = ?`, values);
+  } else {
+    db.run(
+      'INSERT INTO chatgpt_accounts (email, session_token, access_token, status, usage_count) VALUES (?, ?, ?, ?, ?)',
+      [email, sessionToken, accessToken || null, status, 0]
+    );
+  }
+  saveDB();
+
+  db.run('INSERT INTO logs (user_id, action, details, ip_address) VALUES (?, ?, ?, ?)', [
+    req.user.id,
+    existing ? 'registrar_update_account' : 'registrar_save_account',
+    `${existing ? 'Updated' : 'Saved'} ChatGPT account from registrar: ${email}`,
+    req.ip
+  ]);
+  saveDB();
+
+  const account = getOne('SELECT id, email, status, usage_count, created_at, updated_at FROM chatgpt_accounts WHERE email = ?', [email]);
+  res.json({ success: true, account, updated: Boolean(existing) });
+});
+
+app.delete('/api/admin/registrar/mailboxes/:id', authenticateToken, requireAdmin, (req, res) => {
+  const mailbox = getOne('SELECT id, email FROM registrar_mailboxes WHERE id = ?', [req.params.id]);
+  if (!mailbox) return res.status(404).json({ error: '邮箱记录不存在' });
+
+  db.run('DELETE FROM registrar_mailboxes WHERE id = ?', [req.params.id]);
+  saveDB();
+  res.json({ success: true, message: '本地邮箱记录已删除' });
+});
+
 // ==================== 角色管理 ====================
 // Get all roles
 app.get('/api/admin/roles', authenticateToken, requireAdmin, (req, res) => {
@@ -1078,68 +1671,6 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, (req, res) => {
 
 // ==================== Account Pool Routes ====================
 
-app.get('/api/accounts', authenticateToken, requireAdmin, (req, res) => {
-  const accounts = getAll('SELECT * FROM accounts ORDER BY created_at DESC');
-  res.json({ items: accounts, total: accounts.length });
-});
-
-app.post('/api/accounts', authenticateToken, requireAdmin, (req, res) => {
-  const { email, password, type, quota, access_token, refresh_token } = req.body;
-
-  db.run('INSERT INTO accounts (email, password, type, quota, access_token, refresh_token) VALUES (?, ?, ?, ?, ?, ?)', [
-    email,
-    password || null,
-    type || 'free',
-    quota || 0,
-    access_token || null,
-    refresh_token || null
-  ]);
-  saveDB();
-
-  db.run('INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)', [
-    req.user.id,
-    'create_account',
-    `Created account: ${email}`
-  ]);
-  saveDB();
-
-  const newAccount = getOne('SELECT * FROM accounts WHERE email = ? ORDER BY id DESC LIMIT 1', [email]);
-  res.json(newAccount);
-});
-
-app.put('/api/accounts/:id', authenticateToken, requireAdmin, (req, res) => {
-  const { id } = req.params;
-  const { status, quota, type, access_token, refresh_token } = req.body;
-
-  db.run('UPDATE accounts SET status = ?, quota = ?, type = ?, access_token = ?, refresh_token = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [
-    status,
-    quota,
-    type,
-    access_token || null,
-    refresh_token || null,
-    id
-  ]);
-  saveDB();
-
-  res.json({ message: 'Account updated successfully' });
-});
-
-app.delete('/api/accounts/:id', authenticateToken, requireAdmin, (req, res) => {
-  const { id } = req.params;
-
-  db.run('DELETE FROM accounts WHERE id = ?', [id]);
-  saveDB();
-
-  db.run('INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)', [
-    req.user.id,
-    'delete_account',
-    `Deleted account ID: ${id}`
-  ]);
-  saveDB();
-
-  res.json({ message: 'Account deleted successfully' });
-});
-
 // ==================== Role Routes ====================
 
 app.get('/api/roles', authenticateToken, requireAdmin, (req, res) => {
@@ -1238,6 +1769,32 @@ const updateAccountUsage = (accountId, success = true) => {
   saveDB();
 };
 
+const markAccountLimited = (accountId, hours = 1, reason = 'rate_limited') => {
+  const safeHours = Math.max(1, Math.min(48, parseInt(hours, 10) || 1));
+  db.run(
+    `UPDATE chatgpt_accounts
+     SET status = 'limited', cooldown_until = datetime('now', '+' || ? || ' hours'), updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [safeHours, accountId]
+  );
+  saveDB();
+  console.log(`⏳ 账号已受限 ${safeHours} 小时 (${reason}): ${accountId}`);
+};
+
+const isImageGenerationLimitError = (error) => {
+  const text = [
+    error?.message,
+    error?.body,
+    error?.response,
+    error?.details,
+    error?.stack
+  ].filter(Boolean).join('\n').toLowerCase();
+  return text.includes('free plan limit for image generations')
+    || text.includes('hit the free plan limit')
+    || text.includes('limit resets in')
+    || text.includes('create more images when the limit resets');
+};
+
 // Helper: Apply upstream failure to account status based on HTTP code
 // 401/403 -> mark as invalid
 // 429     -> 1 hour cooldown
@@ -1251,6 +1808,143 @@ const markAccountFailure = (accountId, statusCode) => {
   // 429 rate-limit or other upstream errors: cool down for 1 hour
   updateAccountUsage(accountId, false);
 };
+
+const buildTextPrompt = ({ prompt }) => {
+  return [
+    '你是专业的 AI 图片提示词优化助手。你的唯一任务是把用户不完整、不准确、表达不好的想法优化成适合图片生成模型使用的高质量 prompt。',
+    '要求：',
+    '1. 如果用户已经有想法：直接输出一版完整、清晰、可执行、画面感强的优化 prompt。',
+    '2. 如果用户只说“想画科研论文图”“想画海报”“想画产品图”等模糊需求：先给出一版通用可用 prompt，再用简短列表提示还需要补充哪些信息。',
+    '3. 不要闲聊，不要写无关解释，不要返回 JSON。',
+    '4. 输出结构固定为：优化后的 Prompt、还可以补充的信息。',
+    '5. 优化后的 Prompt 尽量适合直接复制到图片生成输入框。',
+    '6. 使用中文。',
+    '',
+    '用户输入：',
+    String(prompt || '').trim()
+  ].join('\n');
+};
+
+const trimTextConversationHistory = (userId) => {
+  db.run(`
+    DELETE FROM text_conversations
+    WHERE user_id = ?
+    AND id NOT IN (
+      SELECT id FROM text_conversations
+      WHERE user_id = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 10
+    )
+  `, [userId, userId]);
+};
+
+const saveTextConversation = (userId, prompt, response, model, cost) => {
+  db.run(
+    'INSERT INTO text_conversations (user_id, prompt, response, model, cost) VALUES (?, ?, ?, ?, ?)',
+    [userId, prompt, response, model, cost]
+  );
+  trimTextConversationHistory(userId);
+  saveDB();
+  return getOne(`
+    SELECT id, prompt, response, model, cost, created_at
+    FROM text_conversations
+    WHERE user_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 1
+  `, [userId]);
+};
+
+const getTextHistory = (userId) => getAll(`
+  SELECT id, prompt, response, model, cost, created_at
+  FROM (
+    SELECT id, prompt, response, model, cost, created_at
+    FROM text_conversations
+    WHERE user_id = ?
+    ORDER BY created_at DESC, id DESC
+    LIMIT 10
+  )
+  ORDER BY created_at ASC, id ASC
+`, [userId]);
+
+app.get('/api/text/history', authenticateToken, (req, res) => {
+  res.json({ items: getTextHistory(req.user.id), limit: 10 });
+});
+
+// Text prompt assistant: waits for complete GPT response, then returns one final SSE result
+app.post('/api/text/stream', authenticateToken, async (req, res) => {
+  const { prompt } = req.body || {};
+  const model = 'gpt-5.5';
+  const cost = 5;
+
+  if (!prompt || !String(prompt).trim()) {
+    return res.status(400).json({ error: 'Prompt is required' });
+  }
+
+  const userRecord = getOne('SELECT credits FROM users WHERE id = ?', [req.user.id]);
+  const currentCredits = userRecord ? (userRecord.credits || 0) : 0;
+  if (currentCredits < cost) {
+    return res.status(402).json({
+      error: `积分不足，当前 ${currentCredits}，需要 ${cost}`,
+      code: 'INSUFFICIENT_CREDITS',
+      currentCredits,
+      requiredCredits: cost
+    });
+  }
+
+  db.run('UPDATE users SET credits = credits - ? WHERE id = ?', [cost, req.user.id]);
+  saveDB();
+
+  const account = getAvailableAccount();
+  if (!account) {
+    db.run('UPDATE users SET credits = credits + ? WHERE id = ?', [cost, req.user.id]);
+    saveDB();
+    return res.status(503).json({ error: '当前没有可用 GPT 账号，请稍后重试' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write(`event: meta\ndata: ${JSON.stringify({ account: account.email, model })}\n\n`);
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+  let closed = false;
+  res.on('close', () => {
+    closed = !res.writableEnded;
+  });
+  const canWrite = () => !closed && !res.destroyed && !res.writableEnded;
+
+  try {
+    const finalText = await textClient.streamText(
+      buildTextPrompt({ prompt }),
+      account,
+      { model },
+      () => {}
+    );
+
+    if (!finalText || !String(finalText).trim()) {
+      throw new Error('文字链路没有返回有效优化结果，请稍后重试');
+    }
+
+    updateAccountUsage(account.id, true);
+    const record = saveTextConversation(req.user.id, String(prompt).trim(), finalText, model, cost);
+    if (canWrite()) {
+      res.write(`event: done\ndata: ${JSON.stringify({ text: finalText, item: record, history: getTextHistory(req.user.id) })}\n\n`);
+      res.end();
+    }
+  } catch (err) {
+    console.error('Text stream error:', err);
+    markAccountFailure(account.id, err.status || 500);
+    db.run('UPDATE users SET credits = credits + ? WHERE id = ?', [cost, req.user.id]);
+    saveDB();
+    if (canWrite()) {
+      res.write(`event: error\ndata: ${JSON.stringify({ error: err.message || '文字生成失败' })}\n\n`);
+      res.end();
+    }
+  }
+});
 
 // User's own images
 app.get('/api/images', authenticateToken, (req, res) => {
@@ -1272,7 +1966,6 @@ app.get('/api/images/download/:id', async (req, res) => {
 
     // If it's an external URL (R2), proxy the download
     if (imageUrl.startsWith('http')) {
-      const fetch = (await import('node-fetch')).default;
       const response = await fetch(imageUrl);
 
       if (!response.ok) {
@@ -1466,6 +2159,12 @@ app.post('/api/images/generate', authenticateToken, async (req, res) => {
       console.error(`❌ 第 ${i + 1}/${requestedCount} 张生成失败:`, error.message);
       lastError = error;
 
+      if (isImageGenerationLimitError(error)) {
+        markAccountLimited(account.id, 12, 'image_generation_free_plan_limit');
+        // 免费生图额度用尽：跳过该账号，继续尝试下一个可用账号
+        continue;
+      }
+
       if (error.status) {
         markAccountFailure(account.id, error.status);
         // 上游错误：继续尝试下一张（用下一个账号）
@@ -1588,9 +2287,9 @@ app.delete('/api/images/:id/like', authenticateToken, (req, res) => {
 app.get('/api/stats', authenticateToken, (req, res) => {
   if (req.user.role === 'admin') {
     const userCount = getOne('SELECT COUNT(*) as count FROM users').count;
-    const accountCount = getOne('SELECT COUNT(*) as count FROM accounts').count;
+    const accountCount = getOne('SELECT COUNT(*) as count FROM chatgpt_accounts').count;
     const imageCount = getOne('SELECT COUNT(*) as count FROM images').count;
-    const activeAccounts = getOne('SELECT COUNT(*) as count FROM accounts WHERE status = ?', ['active']).count;
+    const activeAccounts = getOne('SELECT COUNT(*) as count FROM chatgpt_accounts WHERE status = ?', ['active']).count;
 
     res.json({
       users: userCount,

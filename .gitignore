@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 package-lock.json
+npm-cache/
+backend/npm-cache/
+frontend/npm-cache/
 
 # Environment variables
 .env

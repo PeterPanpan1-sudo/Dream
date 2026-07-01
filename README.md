@@ -186,6 +186,4 @@ cp backend/data/daydream.db backup/daydream-$(date +%Y%m%d).db
 
 MIT License
 
-## 参考项目
 
-本项目参考了 [chatgpt2api](https://github.com/ZyphrZero/chatgpt2api) 的架构设计。
